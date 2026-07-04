@@ -118,6 +118,8 @@ ensure_bitsandbytes_safe()
 import torch
 import os
 
+from .nvfp4_loader import model_has_nvfp4_layers
+
 
 # Flash/Sage Attention & Triton Compatibility Layer
 
@@ -741,6 +743,7 @@ class CompatibleDiT(torch.nn.Module):
         self.model_dtype = self._detect_model_dtype()
         self.is_fp8_model = self.model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         self.is_fp16_model = self.model_dtype == torch.float16
+        self.is_nvfp4_model = getattr(dit_model, "_seedvr2_nvfp4", False) or model_has_nvfp4_layers(dit_model)
 
         # Only convert if not already done (e.g., when reusing cached weights)
         if not skip_conversion and self.is_fp8_model:
@@ -770,8 +773,17 @@ class CompatibleDiT(torch.nn.Module):
     def _detect_model_dtype(self) -> torch.dtype:
         """Detect main model dtype"""
         try:
-            return next(self.dit_model.parameters()).dtype
-        except:
+            for param in self.dit_model.parameters():
+                if param.dtype in (
+                    torch.float32,
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ):
+                    return param.dtype
+            return self.compute_dtype
+        except Exception:
             return torch.bfloat16
     
     def _get_model_variant(self) -> str:
@@ -899,26 +911,29 @@ class CompatibleDiT(torch.nn.Module):
         Conversion strategy:
             - FP16/BFloat16/Float32 models: Use native precision (no conversion needed)
             - FP8 models: Convert FP8 tensors to compute_dtype for arithmetic operations
+            - NVFP4 models: Convert FP32 activations to compute_dtype (NVFP4 kernels require FP16/BF16)
             (FP8 parameters stay in FP8 for memory efficiency, only converted for computation)
         """
         
-        # Only convert if we have an FP8 model for arithmetic operations 
-        if self.is_fp8_model:
-            fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-            target_dtype = self.compute_dtype
-            
-            # Convert args
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        target_dtype = self.compute_dtype
+        needs_conversion = self.is_fp8_model or self.is_nvfp4_model
+
+        if needs_conversion:
             converted_args = []
             for arg in args:
                 if isinstance(arg, torch.Tensor) and arg.dtype in fp8_dtypes:
                     converted_args.append(arg.to(target_dtype))
+                elif isinstance(arg, torch.Tensor) and self.is_nvfp4_model and arg.dtype == torch.float32:
+                    converted_args.append(arg.to(target_dtype))
                 else:
                     converted_args.append(arg)
             
-            # Convert kwargs
             converted_kwargs = {}
             for key, value in kwargs.items():
                 if isinstance(value, torch.Tensor) and value.dtype in fp8_dtypes:
+                    converted_kwargs[key] = value.to(target_dtype)
+                elif isinstance(value, torch.Tensor) and self.is_nvfp4_model and value.dtype == torch.float32:
                     converted_kwargs[key] = value.to(target_dtype)
                 else:
                     converted_kwargs[key] = value
@@ -926,26 +941,31 @@ class CompatibleDiT(torch.nn.Module):
             args = tuple(converted_args)
             kwargs = converted_kwargs
         
-        # Execute forward pass
         try:
+            if self.is_nvfp4_model and self.compute_dtype in (torch.float16, torch.bfloat16):
+                device_type = args[0].device.type if args and isinstance(args[0], torch.Tensor) else "cuda"
+                with torch.autocast(device_type=device_type, dtype=self.compute_dtype, enabled=True):
+                    return self.dit_model(*args, **kwargs)
             return self.dit_model(*args, **kwargs)
         except Exception as e:
             self.debug.log(f"Forward pass error: {e}", level="ERROR", category="generation", force=True)
             if self.is_fp8_model:
                 self.debug.log(f"FP8 model - converted FP8 tensors to {self.compute_dtype}", category="info", force=True)
+            elif self.is_nvfp4_model:
+                self.debug.log(f"NVFP4 model - compute dtype is {self.compute_dtype}", category="info", force=True)
             else:
                 self.debug.log(f"{self.model_dtype} model - no conversion applied", category="info", force=True)
             raise
     
     def __getattr__(self, name):
         """Redirect all other attributes to original model"""
-        if name in ['dit_model', 'model_dtype', 'is_fp8_model', 'is_fp16_model']:
+        if name in ['dit_model', 'model_dtype', 'is_fp8_model', 'is_fp16_model', 'is_nvfp4_model']:
             return super().__getattr__(name)
         return getattr(self.dit_model, name)
     
     def __setattr__(self, name, value):
         """Redirect assignments to original model except for our attributes"""
-        if name in ['dit_model', 'model_dtype', 'is_fp8_model', 'is_fp16_model']:
+        if name in ['dit_model', 'model_dtype', 'is_fp8_model', 'is_fp16_model', 'is_nvfp4_model']:
             super().__setattr__(name, value)
         else:
             if hasattr(self, 'dit_model'):

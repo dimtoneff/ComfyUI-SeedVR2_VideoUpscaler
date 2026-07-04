@@ -76,9 +76,18 @@ if GGUF_AVAILABLE:
     from ..optimization.gguf_ops import replace_linear_with_quantized
 
 from ..utils.constants import get_script_directory, suppress_tensor_warnings
+from ..optimization.nvfp4_loader import (
+    is_nvfp4_checkpoint,
+    is_nvfp4_state_dict,
+    load_nvfp4_model_weights,
+    prepare_nvfp4_state_dict,
+    read_safetensors_metadata,
+)
 
 # Get script directory for config paths
 script_directory = get_script_directory()
+
+_QUANT_STATE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale", ".comfy_quant")
 
 
 def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
@@ -102,7 +111,8 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
         - PyTorch files use memory-mapped loading to reduce RAM usage
     """
     device_str = str(device)
-    
+    safetensors_metadata = {}
+
     if checkpoint_path.endswith('.safetensors'):
         if not SAFETENSORS_AVAILABLE:
             error_msg = (
@@ -115,6 +125,8 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
                 debug.log("This is a one-time installation that will enable loading of .safetensors files", 
                          level="INFO", category="info", force=True)
             raise ImportError(error_msg)
+
+        safetensors_metadata = read_safetensors_metadata(checkpoint_path)
         
         # Try direct device loading first (optimal path)
         try:
@@ -137,6 +149,15 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
             else:
                 # Re-raise if it's a different error (file corruption, etc.)
                 raise
+
+        if is_nvfp4_checkpoint(checkpoint_path, state):
+            if debug:
+                debug.log(
+                    "Detected NVFP4 checkpoint - using ComfyUI mixed precision loading",
+                    category="dit",
+                    force=True,
+                )
+            state = prepare_nvfp4_state_dict(state, safetensors_metadata)
     elif checkpoint_path.endswith('.gguf'):
         validate_gguf_availability(f"load {os.path.basename(checkpoint_path)}", debug)
         state = _load_gguf_state(
@@ -590,7 +611,16 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     if checkpoint_path.endswith('.gguf'):
         model = _load_gguf_weights(model, state, used_meta, model_type_lower, debug)
     else:
-        model = _load_standard_weights(model, state, used_meta, model_type, model_type_lower, debug)
+        model = _load_standard_weights(
+            model,
+            state,
+            used_meta,
+            model_type,
+            model_type_lower,
+            debug,
+            target_device=target_device,
+            override_dtype=override_dtype,
+        )
     
     # Clean up state dict
     del state
@@ -609,6 +639,8 @@ def _convert_state_dtype(state: Dict[str, torch.Tensor], target_dtype: torch.dty
     debug.start_timer(f"{model_type.lower()}_dtype_convert")
     
     for key in state:
+        if any(key.endswith(suffix) for suffix in _QUANT_STATE_SUFFIXES):
+            continue
         if torch.is_tensor(state[key]) and state[key].is_floating_point():
             state[key] = state[key].to(target_dtype)
     
@@ -817,10 +849,17 @@ def initialize_meta_buffers_impl(model: torch.nn.Module, target_device: torch.de
 
 def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 
                           used_meta: bool, model_type: str, model_type_lower: str,
-                          debug: Optional['Debug'] = None) -> torch.nn.Module:
+                          debug: Optional['Debug'] = None,
+                          target_device: Optional[torch.device] = None,
+                          override_dtype: Optional[torch.dtype] = None) -> torch.nn.Module:
     """Load standard (non-GGUF) weights into model."""
     debug.start_timer(f"{model_type_lower}_state_apply")
-    model.load_state_dict(state, strict=False, assign=True)
+    if is_nvfp4_state_dict(state):
+        compute_dtype = override_dtype or torch.bfloat16
+        load_device = target_device or torch.device("cpu")
+        model, _ = load_nvfp4_model_weights(model, state, compute_dtype, load_device, debug)
+    else:
+        model.load_state_dict(state, strict=False, assign=True)
     
     action = "materialized" if used_meta else "applied"
     debug.end_timer(f"{model_type_lower}_state_apply", f"{model_type} weights {action}")
