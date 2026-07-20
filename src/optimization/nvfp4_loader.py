@@ -176,6 +176,17 @@ def load_nvfp4_model_weights(
             category="dit",
             force=True,
         )
+
+    # ComfyUI's mixed_precision_ops._load_quantized_module (and the quantized
+    # Embedding loader) call ``layer_conf.numpy()`` on the ``comfy_quant``
+    # metadata tensor during ``load_state_dict``. That raises
+    # "can't convert cuda:0 device type tensor to numpy" when the tensor lives
+    # on a CUDA device. Our state dict is loaded directly onto the target
+    # (CUDA) device, so force these small JSON-blob tensors to CPU first.
+    for _cq_key in list(state.keys()):
+        if _cq_key.endswith(".comfy_quant") and state[_cq_key].device.type != "cpu":
+            state[_cq_key] = state[_cq_key].to(device="cpu")
+
     model.load_state_dict(state, strict=False, assign=True)
     model._seedvr2_nvfp4 = True
     return model, replacements

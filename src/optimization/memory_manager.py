@@ -886,11 +886,22 @@ def _standard_model_movement(model: torch.nn.Module, current_device: torch.devic
     Returns:
         bool: True if model was moved
     """
-    # Check if model is on meta device - can't move meta tensors
-    if current_device.type == 'meta':
+    # Check if model is on meta device - can't move meta tensors via .to().
+    # Note: current_device is only the FIRST parameter. A model can be only
+    # *partially* materialized (some params on CUDA, others still on meta,
+    # e.g. after a failed weight load). In that case model.to() raises
+    # "Cannot copy out of meta tensor", which would mask the original error
+    # during cleanup. Skip the move whenever ANY parameter is on meta.
+    _has_meta = current_device.type == 'meta' or any(
+        p.device.type == 'meta' for p in model.parameters()
+    )
+    if _has_meta:
         if debug:
-            debug.log(f"{model_name} is on meta device - skipping movement (will materialize when needed)", 
-                     category=model_name.lower())
+            debug.log(
+                f"{model_name} has parameters on the meta device - skipping .to() movement "
+                f"(incomplete materialization; params will be released individually)",
+                category=model_name.lower(),
+            )
         return False
     
     # Determine reason for movement
